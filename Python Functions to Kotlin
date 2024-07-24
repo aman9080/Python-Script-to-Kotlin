@@ -1,0 +1,188 @@
+import android.content.Context
+import android.util.Base64
+import android.util.Log
+import androidx.media3.common.util.Util
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MediaSourceFactory
+import androidx.media3.exoplayer.source.hls.HlsMediaSource
+import androidx.media3.ui.PlayerView
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileWriter
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.*
+
+class DaddyliveAddon(private val context: Context, private val playerView: PlayerView) {
+
+    private val baseUrl = "https://dlhd.so/"
+    private val jsonUrl = "$baseUrl/stream/stream-%s.php"
+    private val scheduleUrl = "$baseUrl/schedule/schedule-generated.json"
+    private val ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private val logPath = context.filesDir.absolutePath
+    private val logFile = File(logPath, "daddylive.log")
+    private val client = OkHttpClient()
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+    private fun log(msg: String) {
+        try {
+            val timestamp = dateFormat.format(Date())
+            val logMsg = "[$timestamp]: $msg"
+            if (!logFile.exists()) {
+                logFile.createNewFile()
+            }
+            val writer = FileWriter(logFile, true)
+            writer.appendLine(logMsg)
+            writer.close()
+            Log.d("DaddyliveAddon", logMsg)
+        } catch (e: IOException) {
+            e.printStackTrace()
+            Log.e("DaddyliveAddon", "Logging failed", e)
+        }
+    }
+
+    private fun getLocalTime(utcTimeStr: String): String {
+        val utcFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+        val localFormat = SimpleDateFormat("hh:mm a", Locale.getDefault())
+        utcFormat.timeZone = TimeZone.getTimeZone("UTC")
+        val date = utcFormat.parse(utcTimeStr)
+        localFormat.timeZone = TimeZone.getDefault()
+        return localFormat.format(date)
+    }
+
+    private fun buildUrl(query: Map<String, String>): String {
+        val encodedQuery = query.map { "${it.key}=${it.value}" }.joinToString("&")
+        return "$baseUrl?$encodedQuery"
+    }
+
+    private fun getCategTrans(): List<Pair<String, String>> {
+        val categs = mutableListOf<Pair<String, String>>()
+        try {
+            val request = Request.Builder().url(scheduleUrl).header("User-Agent", ua).build()
+            val response = client.newCall(request).execute()
+            val schedule = JSONObject(response.body?.string())
+            schedule.keys().forEach { dateKey ->
+                val events = schedule.getJSONObject(dateKey)
+                events.keys().forEach { categ ->
+                    val eventsList = events.getJSONArray(categ)
+                    categs.add(Pair(categ, eventsList.toString()))
+                }
+            }
+            log("Categories fetched successfully")
+        } catch (e: Exception) {
+            e.printStackTrace()
+            log("Error fetching category data: ${e.message}")
+        }
+        return categs
+    }
+
+    private fun showChannels(categ: String, channelsList: List<Map<String, Any>>) {
+        channelsList.forEach { item ->
+            val title = item["title"] as String
+            addDir(title, buildUrl(mapOf("mode" to "trList", "trType" to categ, "channels" to JSONObject(item["channels"]).toString())), true)
+        }
+        log("Channels shown for category: $categ")
+    }
+
+    private fun getTransData(categ: String): List<Map<String, Any>> {
+        val trns = mutableListOf<Map<String, Any>>()
+        val categs = getCategTrans()
+        categs.forEach { (categName, eventsListJson) ->
+            if (categName == categ) {
+                val eventsList = JSONArray(eventsListJson)
+                for (i in 0 until eventsList.length()) {
+                    val item = eventsList.getJSONObject(i)
+                    val event = item.getString("event")
+                    val timeStr = item.getString("time")
+                    val eventTimeLocal = getLocalTime(timeStr)
+                    val title = "$eventTimeLocal $event"
+                    val channels = item.getJSONArray("channels")
+                    val channelList = mutableListOf<Map<String, String>>()
+                    for (j in 0 until channels.length()) {
+                        val channel = channels.getJSONObject(j)
+                        channelList.add(mapOf("channel_name" to channel.getString("channel_name"), "channel_id" to channel.getString("channel_id")))
+                    }
+                    trns.add(mapOf("title" to title, "channels" to channelList))
+                }
+            }
+        }
+        log("Transmission data fetched for category: $categ")
+        return trns
+    }
+
+    private fun playStream(link: String) {
+        val urlStream = "$baseUrl/stream/stream-$link.php"
+        val httpDataSourceFactory = DefaultHttpDataSource.Factory().setUserAgent(ua).setDefaultRequestProperties(mapOf("Referer" to baseUrl))
+        val mediaItem = MediaItem.fromUri(urlStream)
+        val player = ExoPlayer.Builder(context).build().also {
+            it.setMediaItem(mediaItem)
+            it.prepare()
+            it.playWhenReady = true
+        }
+        playerView.player = player
+        log("Playing stream: $urlStream")
+    }
+
+    fun mainMenu() {
+        val menu = listOf(
+            "LIVE SPORTS" to "sched",
+            "LIVE TV" to "live_tv"
+        )
+        menu.forEach { (title, servType) ->
+            addDir(title, buildUrl(mapOf("mode" to "menu", "serv_type" to servType)))
+        }
+        log("Main menu shown")
+    }
+
+    fun addDir(title: String, dirUrl: String, isFolder: Boolean = true) {
+        // Implement the logic to add a directory item
+        log("Added directory item: $title, URL: $dirUrl, isFolder: $isFolder")
+    }
+
+    fun executeMode(mode: String, params: Map<String, String>) {
+        when (mode) {
+            "menu" -> {
+                val servType = params["serv_type"]
+                if (servType == "sched") {
+                    val categs = getCategTrans()
+                    categs.forEach { (categName, _) ->
+                        addDir(categName, buildUrl(mapOf("mode" to "showChannels", "trType" to categName)))
+                    }
+                } else if (servType == "live_tv") {
+                    // Implement list generation logic
+                }
+                log("Executed mode: menu, servType: $servType")
+            }
+            "showChannels" -> {
+                val transType = params["trType"]
+                val channels = getTransData(transType ?: "")
+                showChannels(transType ?: "", channels)
+                log("Executed mode: showChannels, transType: $transType")
+            }
+            "trList" -> {
+                val transType = params["trType"]
+                val channels = JSONArray(params["channels"])
+                // Implement the logic to show transmission list
+                log("Executed mode: trList, transType: $transType")
+            }
+            "trLinks" -> {
+                val trData = params["trData"]
+                // Implement the logic to get source and play stream
+                log("Executed mode: trLinks, trData: $trData")
+            }
+            "play" -> {
+                val url = params["url"]
+                playStream(url ?: "")
+                log("Executed mode: play, URL: $url")
+            }
+            else -> {
+                mainMenu()
+            }
+        }
+    }
+}
